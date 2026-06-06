@@ -4,11 +4,14 @@ automatically submits applications from the configured account.
 """
 
 import logging
+import random
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from config import Config
 from notifier import Notifier
-from plaza_client import PlazaClient, filter_city, is_housing
+from plaza_client import PlazaClient, RateLimited, filter_city, is_housing
 from storage import load_applied, save_applied
 
 logging.basicConfig(
@@ -16,6 +19,8 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("plaza_bot")
+
+_AMS = ZoneInfo("Europe/Amsterdam")
 
 
 # ---------------------------------------------------------------------------
@@ -47,6 +52,38 @@ def _looks_like_session_expired(text: str) -> bool:
     return any(ind in low for ind in indicators)
 
 
+def _in_active_hours(cfg) -> bool:
+    """Return True if the current Amsterdam time is within the configured active window.
+
+    The window is ``[ACTIVE_HOURS_START, ACTIVE_HOURS_END)``.
+    ACTIVE_HOURS_END == 24 means the window extends until midnight.
+    """
+    hour = datetime.now(_AMS).hour
+    return cfg.ACTIVE_HOURS_START <= hour < cfg.ACTIVE_HOURS_END
+
+
+def _seconds_until_active(cfg) -> int:
+    """Compute seconds until the next ACTIVE_HOURS_START in Amsterdam time.
+
+    Always returns a positive value (minimum 60 s) so callers can sleep safely.
+    """
+    now = datetime.now(_AMS)
+    hour = now.hour
+    minute = now.minute
+    second = now.second
+    start = cfg.ACTIVE_HOURS_START
+
+    minutes_elapsed_in_hour = minute * 60 + second
+    if hour < start:
+        # Still today — wait from now until start hour
+        seconds = (start - hour) * 3600 - minutes_elapsed_in_hour
+    else:
+        # start is tomorrow
+        seconds = (24 - hour + start) * 3600 - minutes_elapsed_in_hour
+
+    return max(60, int(seconds))
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -69,6 +106,7 @@ def main() -> None:
         cfg.PLAZA_PASSWORD,
         session_cookie=cfg.PLAZA_SESSION_COOKIE or None,
         client_id=cfg.PLAZA_CLIENT_ID,
+        session_file=cfg.SESSION_FILE,
     )
     if not logged_in:
         if cfg.DRY_RUN:
@@ -101,13 +139,39 @@ def main() -> None:
             logger.warning("Could not sync active reactions at startup: %s", e)
 
     logger.info(
-        "Starting poll loop — city=%s interval=%ds degraded=%s",
+        "Starting poll loop — city=%s poll=[%ds,%ds] active_hours=[%d,%d) degraded=%s",
         cfg.TARGET_CITY,
-        cfg.POLL_INTERVAL_SECONDS,
+        cfg.POLL_INTERVAL_MIN_SECONDS,
+        cfg.POLL_INTERVAL_MAX_SECONDS,
+        cfg.ACTIVE_HOURS_START,
+        cfg.ACTIVE_HOURS_END,
         degraded,
     )
 
+    _sleeping_outside_hours = False  # track transitions to avoid log spam
+
     while True:
+        # -- Active-hours gate --
+        if not _in_active_hours(cfg):
+            if not _sleeping_outside_hours:
+                secs = _seconds_until_active(cfg)
+                logger.info(
+                    "Outside active hours (%d–%d Amsterdam). "
+                    "Next check in ~%ds. Polls paused.",
+                    cfg.ACTIVE_HOURS_START,
+                    cfg.ACTIVE_HOURS_END,
+                    secs,
+                )
+                _sleeping_outside_hours = True
+            nap = min(900, _seconds_until_active(cfg))
+            time.sleep(nap)
+            continue
+
+        # Transitioned back into active hours
+        if _sleeping_outside_hours:
+            logger.info("Re-entered active hours — resuming polls.")
+            _sleeping_outside_hours = False
+
         try:
             listings = client.get_listings()
             delft = filter_city(listings, cfg.TARGET_CITY)
@@ -141,6 +205,14 @@ def main() -> None:
                 )
 
                 if cfg.DRY_RUN:
+                    delay = random.uniform(
+                        cfg.APPLY_DELAY_MIN_SECONDS, cfg.APPLY_DELAY_MAX_SECONDS
+                    )
+                    logger.info(
+                        "[DRY_RUN] would wait ~%.0fs before applying to %s",
+                        delay,
+                        address,
+                    )
                     msg = (
                         f"[DRY_RUN] Would apply to:\n"
                         f"  {address}\n"
@@ -172,6 +244,17 @@ def main() -> None:
                     )
                     continue
 
+                # Human delay before applying
+                apply_delay = random.uniform(
+                    cfg.APPLY_DELAY_MIN_SECONDS, cfg.APPLY_DELAY_MAX_SECONDS
+                )
+                logger.info(
+                    "Waiting %.0fs before applying to %s to look human",
+                    apply_delay,
+                    address,
+                )
+                time.sleep(apply_delay)
+
                 # Attempt to apply
                 ok, snippet = client.react(obj_id)
 
@@ -185,6 +268,7 @@ def main() -> None:
                         cfg.PLAZA_PASSWORD,
                         session_cookie=cfg.PLAZA_SESSION_COOKIE or None,
                         client_id=cfg.PLAZA_CLIENT_ID,
+                        session_file=cfg.SESSION_FILE,
                     )
                     if re_logged:
                         ok, snippet = client.react(obj_id)
@@ -216,10 +300,29 @@ def main() -> None:
                         "react() failed for id=%s: %s", obj_id, snippet[:200]
                     )
 
+        except RateLimited as e:
+            cooldown = cfg.RATE_LIMIT_COOLDOWN_SECONDS
+            minutes = cooldown // 60
+            logger.warning(
+                "Rate-limited (HTTP %s) — cooling down for %d minutes to avoid a ban",
+                e,
+                minutes,
+            )
+            notifier.send(
+                f"[WARNING] Plaza rate-limited us (HTTP {e}). "
+                f"Pausing for {minutes} min to avoid a ban."
+            )
+            time.sleep(cooldown)
+            continue
+
         except Exception as e:
             logger.exception("Unhandled error in poll loop: %s", e)
 
-        time.sleep(cfg.POLL_INTERVAL_SECONDS)
+        sleep_secs = random.uniform(
+            cfg.POLL_INTERVAL_MIN_SECONDS, cfg.POLL_INTERVAL_MAX_SECONDS
+        )
+        logger.debug("Sleeping %.1fs until next poll", sleep_secs)
+        time.sleep(sleep_secs)
 
 
 if __name__ == "__main__":

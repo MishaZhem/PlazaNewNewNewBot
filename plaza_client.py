@@ -13,11 +13,17 @@ Primary path — OAuth2 password grant:
 
 Cookie fallback — if PLAZA_SESSION_COOKIE is set, inject it directly and verify.
 
+Session persistence — if a session_file is passed to login(), the client will
+  try to reuse a previously saved session (cookies + tokens) before attempting a
+  full password grant.  On any successful auth the session is saved back.
+
 is_logged_in() and react() work once either path succeeds (Bearer header + session
 cookie are both carried on subsequent requests by the shared httpx.Client).
 """
 
+import json
 import logging
+import os
 from typing import Optional
 
 import httpx
@@ -27,12 +33,27 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://plaza.newnewnew.space"
 
 _DEFAULT_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "application/json",
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "nl-NL,nl;q=0.9,en;q=0.8",
     "X-Requested-With": "XMLHttpRequest",
+    "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"macOS"',
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
+    "Origin": "https://plaza.newnewnew.space",
+    "Referer": "https://plaza.newnewnew.space/",
 }
+
+
+class RateLimited(Exception):
+    """Raised when the server responds with HTTP 429 or 403."""
 
 
 def filter_city(listings: list[dict], city: str) -> list[dict]:
@@ -60,6 +81,7 @@ class PlazaClient:
             timeout=30,
             follow_redirects=True,
         )
+        self._refresh_token: Optional[str] = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -69,14 +91,19 @@ class PlazaClient:
         """Fetch all listings (no auth required).
 
         Returns the list under the ``result`` key, or an empty list on error.
+        Raises RateLimited if the server responds with HTTP 429 or 403.
         """
         try:
             resp = self._client.post(
                 "/portal/object/frontend/getallobjects/format/json"
             )
+            if resp.status_code in (429, 403):
+                raise RateLimited(resp.status_code)
             resp.raise_for_status()
             data = resp.json()
             return data.get("result", [])
+        except RateLimited:
+            raise
         except Exception as e:
             logger.error("get_listings failed: %s", e)
             return []
@@ -103,33 +130,51 @@ class PlazaClient:
         password: str,
         session_cookie: Optional[str] = None,
         client_id: str = "wzp",
+        session_file: Optional[str] = None,
     ) -> bool:
         """Authenticate with the portal.
 
-        Cookie fallback (fastest): if *session_cookie* is provided and non-empty,
-        inject it via _inject_cookies and verify with is_logged_in().
-
-        Primary path — OAuth2 password grant to auth.hexia.io:
-          1. POST https://auth.hexia.io/api/v1/oauth/token with JSON creds.
-          2. Set the returned access token as Bearer header.
-          3. POST /portal/account/frontend/loginbyservice/format/json to
-             convert the OAuth token into a plaza session cookie.
-          4. Return is_logged_in().
+        Precedence:
+          1. Cookie fallback: if *session_cookie* is provided and non-empty,
+             inject it and verify with is_logged_in().
+          2. Session reuse: if *session_file* is provided and the file exists,
+             load cookies + tokens; if already logged in, return True without
+             hitting the password grant.
+          3. Refresh-token: if a refresh token was loaded from the session file,
+             try a refresh grant; on success save and return True.
+          4. OAuth2 password grant: full login; on success save and return True.
 
         Returns True if a session is established, False otherwise.
         """
-        # --- Cookie fallback ---
+        # 1. Cookie fallback
         if session_cookie and session_cookie.strip():
             logger.info("Using provided PLAZA_SESSION_COOKIE")
             self._inject_cookies(session_cookie)
             result = self.is_logged_in()
             if result:
                 logger.info("Session cookie verified — logged in")
+                if session_file:
+                    self.save_session(session_file)
             else:
                 logger.warning("Session cookie injected but is_logged_in() returned False")
             return result
 
-        # --- OAuth2 password grant ---
+        # 2. Attempt to reuse a persisted session
+        if session_file and self.load_session(session_file):
+            if self.is_logged_in():
+                logger.info("Reused saved session")
+                return True
+
+            # 3. Try refresh-token grant
+            if self._refresh_token:
+                logger.info("Saved session expired; attempting token refresh")
+                if self._refresh(client_id):
+                    if session_file:
+                        self.save_session(session_file)
+                    return True
+                logger.warning("Token refresh failed; falling back to password grant")
+
+        # 4. OAuth2 password grant
         logger.info("Attempting OAuth2 password grant for user %s", username)
         auth_url = "https://auth.hexia.io/api/v1/oauth/token"
         try:
@@ -190,8 +235,11 @@ class PlazaClient:
             )
             return False
 
-        # Store access token on the shared client
+        # Store access token and optional refresh token on the shared client
         self._client.headers["Authorization"] = f"Bearer {access_token}"
+        refresh_token = data.get("refreshToken") or data.get("refresh_token")
+        if refresh_token:
+            self._refresh_token = refresh_token
         logger.info("OAuth access token obtained; starting portal session")
 
         # Convert OAuth token → plaza session cookie
@@ -209,7 +257,10 @@ class PlazaClient:
             logger.error("loginbyservice request failed: %s", e)
             return False
 
-        return self.is_logged_in()
+        result = self.is_logged_in()
+        if result and session_file:
+            self.save_session(session_file)
+        return result
 
     def is_logged_in(self) -> bool:
         """Return True if the current session appears to be authenticated."""
@@ -250,6 +301,9 @@ class PlazaClient:
         Returns:
             (success, response_text_snippet) — success is True when the
             response is 2xx and does not look like an error response.
+
+        Raises:
+            RateLimited: if the server responds with HTTP 429 or 403.
         """
         try:
             resp = self._client.post(
@@ -257,6 +311,8 @@ class PlazaClient:
                 json={"objectType": object_type, "objectId": object_id},
             )
             snippet = resp.text[:300]
+            if resp.status_code in (429, 403):
+                raise RateLimited(resp.status_code)
             if resp.status_code >= 400:
                 return False, snippet
             # Check for error indicators in the body
@@ -271,12 +327,128 @@ class PlazaClient:
             except Exception:
                 pass
             return True, snippet
+        except RateLimited:
+            raise
         except Exception as e:
             return False, str(e)
 
     # ------------------------------------------------------------------
+    # Session persistence
+    # ------------------------------------------------------------------
+
+    def save_session(self, path: str) -> None:
+        """Persist cookies, access token, and refresh token to *path* as JSON."""
+        cookies = {name: value for name, value in self._client.cookies.items()}
+        access_token: Optional[str] = None
+        auth_header = self._client.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            access_token = auth_header[len("Bearer "):]
+        data = {
+            "cookies": cookies,
+            "access_token": access_token,
+            "refresh_token": self._refresh_token,
+        }
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            logger.debug("Session saved to %s", path)
+        except Exception as e:
+            logger.warning("Could not save session to %s: %s", path, e)
+
+    def load_session(self, path: str) -> bool:
+        """Load cookies and tokens from *path*.
+
+        Returns True if any data was loaded, False if the file is missing or
+        empty/corrupt.
+        """
+        if not os.path.exists(path):
+            return False
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            logger.warning("Could not load session from %s: %s", path, e)
+            return False
+
+        loaded_anything = False
+
+        cookies: dict = data.get("cookies") or {}
+        for name, value in cookies.items():
+            self._client.cookies.set(name, value)
+            loaded_anything = True
+
+        access_token = data.get("access_token")
+        if access_token:
+            self._client.headers["Authorization"] = f"Bearer {access_token}"
+            loaded_anything = True
+
+        refresh_token = data.get("refresh_token")
+        if refresh_token:
+            self._refresh_token = refresh_token
+            loaded_anything = True
+
+        if loaded_anything:
+            logger.debug("Session loaded from %s", path)
+        return loaded_anything
+
+    # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _refresh(self, client_id: str) -> bool:
+        """Attempt an OAuth2 refresh-token grant.
+
+        On success: updates the Authorization header, stores the new refresh
+        token, calls loginbyservice, and returns is_logged_in().
+        On failure: returns False.
+        """
+        if not self._refresh_token:
+            return False
+        auth_url = "https://auth.hexia.io/api/v1/oauth/token"
+        try:
+            resp = self._client.post(
+                auth_url,
+                json={
+                    "client_id": client_id,
+                    "grant_type": "refresh_token",
+                    "refresh_token": self._refresh_token,
+                },
+                headers={
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                    "Origin": "https://plaza.newnewnew.space",
+                    "Referer": "https://plaza.newnewnew.space/",
+                },
+            )
+            data = resp.json()
+        except Exception as e:
+            logger.warning("Refresh-token request failed: %s", e)
+            return False
+
+        if "error" in data:
+            logger.warning("Refresh-token error: %s", data.get("error_description") or data["error"])
+            return False
+
+        access_token = data.get("accessToken") or data.get("access_token")
+        if not access_token:
+            logger.warning("Refresh-token response contained no access token")
+            return False
+
+        self._client.headers["Authorization"] = f"Bearer {access_token}"
+        new_refresh = data.get("refreshToken") or data.get("refresh_token")
+        if new_refresh:
+            self._refresh_token = new_refresh
+
+        # Convert refreshed OAuth token → plaza session cookie
+        try:
+            self._client.post(
+                "/portal/account/frontend/loginbyservice/format/json",
+                headers={"Accept": "application/json"},
+            )
+        except Exception as e:
+            logger.warning("loginbyservice after refresh failed: %s", e)
+
+        return self.is_logged_in()
 
     def _inject_cookies(self, cookie_header: str) -> None:
         """Parse a raw Cookie header string and add cookies to the client jar."""

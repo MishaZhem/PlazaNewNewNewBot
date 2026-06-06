@@ -1,5 +1,6 @@
 .env
 applied.json
+session.json
 __pycache__/
 *.pyc
 .venv/
