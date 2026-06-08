@@ -31,6 +31,7 @@ import httpx
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://plaza.newnewnew.space"
+OAUTH_TOKEN_PATH = "/portal/proxy/frontend/api/v1/oauth/token"
 
 _DEFAULT_HEADERS = {
     "User-Agent": (
@@ -176,10 +177,9 @@ class PlazaClient:
 
         # 4. OAuth2 password grant
         logger.info("Attempting OAuth2 password grant for user %s", username)
-        auth_url = "https://auth.hexia.io/api/v1/oauth/token"
         try:
             resp = self._client.post(
-                auth_url,
+                OAUTH_TOKEN_PATH,
                 json={
                     "client_id": client_id,
                     "grant_type": "password",
@@ -404,10 +404,9 @@ class PlazaClient:
         """
         if not self._refresh_token:
             return False
-        auth_url = "https://auth.hexia.io/api/v1/oauth/token"
         try:
             resp = self._client.post(
-                auth_url,
+                OAUTH_TOKEN_PATH,
                 json={
                     "client_id": client_id,
                     "grant_type": "refresh_token",
