@@ -296,11 +296,13 @@ class PlazaClient:
 
         Args:
             object_id: The listing id (e.g. "13106").
-            object_type: Always "woning" per the verified API.
+            object_type: Kept for signature compatibility; NOT sent in the
+                         request body (the portal endpoint ignores it and
+                         only needs objectId form-encoded).
 
         Returns:
             (success, response_text_snippet) — success is True when the
-            response is 2xx and does not look like an error response.
+            portal confirms the reaction was processed.
 
         Raises:
             RateLimited: if the server responds with HTTP 429 or 403.
@@ -308,25 +310,39 @@ class PlazaClient:
         try:
             resp = self._client.post(
                 "/portal/object/frontend/react/format/json",
-                json={"objectType": object_type, "objectId": object_id},
+                data={"objectId": object_id},
+                headers={"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"},
             )
             snippet = resp.text[:300]
             if resp.status_code in (429, 403):
                 raise RateLimited(resp.status_code)
             if resp.status_code >= 400:
                 return False, snippet
-            # Check for error indicators in the body
             try:
                 body = resp.json()
-                if isinstance(body, dict) and (
-                    body.get("error")
-                    or body.get("status") == "error"
-                    or body.get("success") is False
-                ):
-                    return False, snippet
             except Exception:
-                pass
-            return True, snippet
+                return False, snippet
+            if not isinstance(body, dict):
+                return False, snippet
+            # Bootstrap config payload — request was not processed by the portal
+            if "sAngularServiceData" in body:
+                return False, "not processed (got bootstrap config — session or payload issue): " + snippet
+            # Explicit success indicators
+            if (
+                body.get("success") is True
+                or "reactionData" in body
+                or "numberOfReactions" in body
+            ):
+                return True, snippet
+            # Explicit failure indicators
+            if (
+                body.get("error")
+                or body.get("status") == "error"
+                or body.get("success") is False
+            ):
+                return False, snippet
+            # Unknown shape — treat as failure to avoid false positives
+            return False, snippet
         except RateLimited:
             raise
         except Exception as e:
