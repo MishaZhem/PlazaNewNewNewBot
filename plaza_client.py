@@ -19,6 +19,12 @@ Session persistence — if a session_file is passed to login(), the client will
 
 is_logged_in() and react() work once either path succeeds (Bearer header + session
 cookie are both carried on subsequent requests by the shared httpx.Client).
+
+Every ``/portal/**/format/json`` response also carries a top-level
+``sAngularServiceData`` key — an Angular bootstrap config string the portal
+attaches to *every* response, success or failure. The real payload always
+sits in a sibling key (e.g. ``account``, ``result``). Its presence must never
+be treated as an error indicator; see ``_payload()``.
 """
 
 import json
@@ -72,6 +78,17 @@ def is_housing(item: dict) -> bool:
     return cat == "woning"
 
 
+def _payload(body: object) -> dict:
+    """Strip the Angular bootstrap config the portal attaches to every response.
+
+    Portal endpoints always return ``sAngularServiceData`` alongside the real
+    payload; its presence says nothing about success or failure.
+    """
+    if isinstance(body, dict):
+        return {k: v for k, v in body.items() if k != "sAngularServiceData"}
+    return {}
+
+
 class PlazaClient:
     """Thin HTTP wrapper around the plaza.newnewnew.space portal API."""
 
@@ -112,15 +129,22 @@ class PlazaClient:
     def get_active_reactions(self) -> set[str]:
         """Return object ids for all current active applications on this account.
 
-        Walks the response defensively — never raises, returns empty set on error.
+        Reads ``result.items[].object.id`` from the response. Defensive —
+        never raises, returns empty set on error.
         """
         try:
             resp = self._client.post(
-                "/portal/registration/frontend/getactievereacties/format/json"
+                "/portal/registration/frontend/getactievereacties/format/json",
+                json={},
             )
             resp.raise_for_status()
-            data = resp.json()
-            return self._extract_ids(data)
+            items = ((_payload(resp.json()).get("result") or {}).get("items")) or []
+            ids = set()
+            for item in items:
+                obj_id = (item.get("object") or {}).get("id")
+                if obj_id is not None:
+                    ids.add(str(obj_id))
+            return ids
         except Exception as e:
             logger.warning("get_active_reactions failed: %s", e)
             return set()
@@ -270,20 +294,11 @@ class PlazaClient:
             )
             if resp.status_code >= 400:
                 return False
-            data = resp.json()
-            # A real account response has account-ish keys; an error/guest
-            # response typically has an "error" key or an empty result.
-            if isinstance(data, dict):
-                if data.get("error") or data.get("status") == "error":
-                    return False
-                # Look for any key that suggests a real account object
-                account_keys = {"id", "email", "gebruikersnaam", "voornaam", "achternaam", "name"}
-                result = data.get("result") or data
-                if isinstance(result, dict) and account_keys.intersection(result.keys()):
-                    return True
-                # If result is a non-empty dict without obvious error, be lenient
-                if isinstance(result, dict) and result:
-                    return True
+            account = _payload(resp.json()).get("account")
+            if isinstance(account, dict) and (
+                account.get("username") or account.get("persons")
+            ):
+                return True
             return False
         except Exception as e:
             logger.debug("is_logged_in check failed: %s", e)
@@ -313,36 +328,34 @@ class PlazaClient:
                 data={"objectId": object_id},
                 headers={"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"},
             )
-            snippet = resp.text[:300]
             if resp.status_code in (429, 403):
                 raise RateLimited(resp.status_code)
             if resp.status_code >= 400:
-                return False, snippet
+                return False, resp.text[:300]
             try:
-                body = resp.json()
+                parsed = resp.json()
             except Exception:
-                return False, snippet
-            if not isinstance(body, dict):
-                return False, snippet
-            # Bootstrap config payload — request was not processed by the portal
-            if "sAngularServiceData" in body:
-                return False, "not processed (got bootstrap config — session or payload issue): " + snippet
+                return False, resp.text[:300]
+
+            body = _payload(parsed)
+            try:
+                snippet = json.dumps(body)[:300]
+            except Exception:
+                snippet = str(body)[:300]
+
             # Explicit success indicators
-            if (
-                body.get("success") is True
-                or "reactionData" in body
-                or "numberOfReactions" in body
+            if body.get("success") is True or (
+                {"reactionId", "reactionData", "numberOfReactions"} & body.keys()
             ):
                 return True, snippet
-            # Explicit failure indicators
-            if (
-                body.get("error")
-                or body.get("status") == "error"
-                or body.get("success") is False
-            ):
-                return False, snippet
-            # Unknown shape — treat as failure to avoid false positives
-            return False, snippet
+
+            # Not obviously a success — authoritative re-check against the
+            # account's active reactions before declaring failure.
+            if object_id in self.get_active_reactions():
+                return True, "confirmed via active reactions"
+
+            message = body.get("sMessage") or body.get("aErrorCodes") or snippet
+            return False, str(message)[:300]
         except RateLimited:
             raise
         except Exception as e:
@@ -473,22 +486,3 @@ class PlazaClient:
                 name, _, value = pair.partition("=")
                 self._client.cookies.set(name.strip(), value.strip())
 
-    @staticmethod
-    def _extract_ids(data: object) -> set[str]:
-        """Walk arbitrary JSON and collect values of id-like keys."""
-        ids: set[str] = set()
-        _ID_KEYS = {"objectId", "id", "advertentieId", "objectid"}
-
-        def _walk(node: object) -> None:
-            if isinstance(node, dict):
-                for k, v in node.items():
-                    if k in _ID_KEYS and v is not None:
-                        ids.add(str(v))
-                    else:
-                        _walk(v)
-            elif isinstance(node, list):
-                for item in node:
-                    _walk(item)
-
-        _walk(data)
-        return ids
