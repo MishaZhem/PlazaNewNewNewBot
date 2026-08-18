@@ -16,6 +16,8 @@ Cookie fallback — if PLAZA_SESSION_COOKIE is set, inject it directly and verif
 Session persistence — if a session_file is passed to login(), the client will
   try to reuse a previously saved session (cookies + tokens) before attempting a
   full password grant.  On any successful auth the session is saved back.
+  Stale cookies from a saved session are discarded before any fresh grant,
+  because the portal rejects loginbyservice when they are present.
 
 is_logged_in() and react() work once either path succeeds (Bearer header + session
 cookie are both carried on subsequent requests by the shared httpx.Client).
@@ -200,6 +202,7 @@ class PlazaClient:
                 logger.warning("Token refresh failed; falling back to password grant")
 
         # 4. OAuth2 password grant
+        self._reset_auth_state()
         logger.info("Attempting OAuth2 password grant for user %s", username)
         try:
             resp = self._client.post(
@@ -272,11 +275,18 @@ class PlazaClient:
                 "/portal/account/frontend/loginbyservice/format/json",
                 headers={"Accept": "application/json"},
             )
-            logger.debug(
-                "loginbyservice status=%d body=%.200s",
-                portal_resp.status_code,
-                portal_resp.text,
-            )
+            if portal_resp.status_code >= 400:
+                logger.warning(
+                    "loginbyservice failed: status=%d body=%.200s",
+                    portal_resp.status_code,
+                    portal_resp.text,
+                )
+            else:
+                logger.debug(
+                    "loginbyservice status=%d body=%.200s",
+                    portal_resp.status_code,
+                    portal_resp.text,
+                )
         except Exception as e:
             logger.error("loginbyservice request failed: %s", e)
             return False
@@ -424,6 +434,18 @@ class PlazaClient:
     # Helpers
     # ------------------------------------------------------------------
 
+    def _reset_auth_state(self) -> None:
+        """Drop all cookies and tokens from the shared client.
+
+        Stale cookies loaded from a persisted session make the portal's
+        loginbyservice endpoint fail with HTTP 500 even when a freshly issued
+        OAuth token is present, so the jar must be emptied before any fresh
+        grant.
+        """
+        self._client.cookies.clear()
+        self._client.headers.pop("Authorization", None)
+        self._refresh_token = None
+
     def _refresh(self, client_id: str) -> bool:
         """Attempt an OAuth2 refresh-token grant.
 
@@ -466,6 +488,10 @@ class PlazaClient:
         new_refresh = data.get("refreshToken") or data.get("refresh_token")
         if new_refresh:
             self._refresh_token = new_refresh
+
+        # Stale cookies from the previous session break loginbyservice, so
+        # drop them before converting the refreshed OAuth token.
+        self._client.cookies.clear()
 
         # Convert refreshed OAuth token → plaza session cookie
         try:
