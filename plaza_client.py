@@ -27,12 +27,30 @@ Every ``/portal/**/format/json`` response also carries a top-level
 attaches to *every* response, success or failure. The real payload always
 sits in a sibling key (e.g. ``account``, ``result``). Its presence must never
 be treated as an error indicator; see ``_payload()``.
+
+Applying (react)
+-----------------
+The real frontend applies to a listing in three steps:
+  1. GET  /portal/core/frontend/getformsubmitonlyconfiguration/format/json —
+     yields a session-bound ``__hash__`` CSRF token (``_form_hash()``).
+  2. POST /portal/object/frontend/getreagerendata/format/json with
+     ``objectId[]=<id>`` — yields, per object, whether it can be reacted to
+     and a ``url`` such as ``?add=10320&dwellingID=15191`` whose query
+     parameters are the actual react request body
+     (``get_reageren_data()``).
+  3. POST /portal/object/frontend/react/format/json with those parameters
+     plus ``__hash__`` from step 1.
+
+All ``/portal/**`` endpoints require form-urlencoded bodies (``objectId[]=..``
+style), never JSON — a JSON body makes some endpoints (e.g. ``getobject``)
+answer with ``{"sMessage": "Onbekende fout"}``.
 """
 
 import json
 import logging
 import os
 from typing import Optional
+from urllib.parse import parse_qsl
 
 import httpx
 
@@ -40,6 +58,8 @@ logger = logging.getLogger(__name__)
 
 BASE_URL = "https://plaza.newnewnew.space"
 OAUTH_TOKEN_PATH = "/portal/proxy/frontend/api/v1/oauth/token"
+
+_FORM_HEADERS = {"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"}
 
 _DEFAULT_HEADERS = {
     "User-Agent": (
@@ -150,6 +170,25 @@ class PlazaClient:
         except Exception as e:
             logger.warning("get_active_reactions failed: %s", e)
             return set()
+
+    def get_reageren_data(self, object_ids: list[str]) -> dict[str, dict]:
+        """Return the portal's per-object reaction metadata, keyed by object id.
+
+        Each entry carries ``kanReageren``, ``action`` ("add" or "remove") and
+        ``url`` — a query string such as ``?add=10320&dwellingID=15191`` whose
+        parameters form the body of the actual react request.
+        """
+        try:
+            resp = self._client.post(
+                "/portal/object/frontend/getreagerendata/format/json",
+                data={"objectId[]": [str(i) for i in object_ids]},
+                headers=_FORM_HEADERS,
+            )
+            resp.raise_for_status()
+            return _payload(resp.json()).get("reagerenData") or {}
+        except Exception as e:
+            logger.warning("get_reageren_data failed: %s", e)
+            return {}
 
     def login(
         self,
@@ -319,11 +358,14 @@ class PlazaClient:
     ) -> tuple[bool, str]:
         """Submit an application for a listing.
 
+        The real request body is not ``objectId`` — it is ``__hash__`` (a
+        session-bound CSRF token from ``_form_hash()``) plus the parameters
+        parsed out of the object's reaction ``url`` (from
+        ``get_reageren_data()``), e.g. ``add=<toewijzingID>&dwellingID=<objectId>``.
+
         Args:
             object_id: The listing id (e.g. "13106").
-            object_type: Kept for signature compatibility; NOT sent in the
-                         request body (the portal endpoint ignores it and
-                         only needs objectId form-encoded).
+            object_type: Kept for signature compatibility only; not used.
 
         Returns:
             (success, response_text_snippet) — success is True when the
@@ -333,10 +375,31 @@ class PlazaClient:
             RateLimited: if the server responds with HTTP 429 or 403.
         """
         try:
+            object_id = str(object_id)
+            info = self.get_reageren_data([object_id]).get(object_id)
+            if not info:
+                return False, f"no reageren data for object {object_id}"
+            action = info.get("action")
+            if action == "remove":
+                # A reaction already exists; the same endpoint would withdraw it.
+                return True, "already applied"
+            if action != "add":
+                return False, f"unexpected reaction action {action!r}"
+            if not info.get("kanReageren"):
+                return False, "portal says kanReageren=false for this object"
+            params = dict(parse_qsl((info.get("url") or "").lstrip("?")))
+            if "add" not in params:
+                return False, f"no add parameter in reaction url {info.get('url')!r}"
+            form_hash = self._form_hash()
+            if form_hash:
+                params["__hash__"] = form_hash
+            else:
+                logger.warning("Could not obtain form __hash__; react will likely fail")
+
             resp = self._client.post(
                 "/portal/object/frontend/react/format/json",
-                data={"objectId": object_id},
-                headers={"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"},
+                data=params,
+                headers=_FORM_HEADERS,
             )
             if resp.status_code in (429, 403):
                 raise RateLimited(resp.status_code)
@@ -433,6 +496,24 @@ class PlazaClient:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _form_hash(self) -> Optional[str]:
+        """Fetch the session-bound ``__hash__`` CSRF token the portal forms require."""
+        try:
+            resp = self._client.get(
+                "/portal/core/frontend/getformsubmitonlyconfiguration/format/json"
+            )
+            resp.raise_for_status()
+            elements = (
+                _payload(resp.json()).get("form", {}).get("elements", {})
+            )
+            hash_element = elements.get("__hash__")
+            if isinstance(hash_element, dict):
+                return hash_element.get("initialData")
+            return None
+        except Exception as e:
+            logger.warning("_form_hash failed: %s", e)
+            return None
 
     def _reset_auth_state(self) -> None:
         """Drop all cookies and tokens from the shared client.
